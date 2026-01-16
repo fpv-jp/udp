@@ -1,0 +1,79 @@
+# This workflow will build a Java project with Maven, and cache/restore any dependencies to improve the workflow execution time
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-java-with-maven
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+name: Java CI with Maven
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            profile: macos
+            artifact_glob: target/dist/*.dmg
+          - os: ubuntu-latest
+            profile: linux
+            artifact_glob: target/dist/*.deb
+          - os: windows-latest
+            profile: windows
+            artifact_glob: target/dist/*.msi
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 25
+      uses: actions/setup-java@v4
+      with:
+        java-version: '25'
+        distribution: 'temurin'
+        cache: maven
+    - name: Build with Maven
+      run: mvn -B -P${{ matrix.profile }} package --file pom.xml
+    - name: Upload dist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: udp-${{ matrix.profile }}-dist
+        path: ${{ matrix.artifact_glob }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download macOS artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: udp-macos-dist
+        path: dist
+    - name: Download Linux artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: udp-linux-dist
+        path: dist
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: udp-windows-dist
+        path: dist
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/**
+
+    # Optional: Uploads the full dependency graph to GitHub to improve the quality of Dependabot alerts this repository can receive
