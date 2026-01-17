@@ -49,6 +49,7 @@ public class main {
     private static final String ENCODING_PCMU = "PCMU";
 
     private static Element videoUdpSrc;
+    private static Pad spectrumMixerPad;
     private static volatile boolean timeoutEnabled = false;
     private static volatile String currentEncoding = ENCODING_H264;
     private static volatile int currentPort = 5000;
@@ -64,9 +65,8 @@ public class main {
             GstVideoComponent videoComponent = new GstVideoComponent();
             videoComponent.setKeepAspect(true);
             Pipeline[] pipelineRef = new Pipeline[1];
-            pipelineRef[0] = buildPipeline(videoComponent, currentEncoding, currentPort);
             Pipeline[] audioPipelineRef = new Pipeline[1];
-            audioPipelineRef[0] = buildAudioPipeline(currentAudioEncoding, currentAudioPort);
+            pipelineRef[0] = buildCombinedPipeline(videoComponent, currentEncoding, currentPort, currentAudioEncoding, currentAudioPort);
             JLabel statusLabel = buildStatusLabel();
             updateStatusLabel(statusLabel);
 
@@ -95,15 +95,129 @@ public class main {
             frame.setVisible(true);
 
             pipelineRef[0].play();
-            if (audioPipelineRef[0] != null) {
-                audioPipelineRef[0].play();
-            }
             startAutoResize(frame, videoComponent, videoComponent.getElement());
             attachStopOnTimeout(pipelineRef[0], frame);
         });
     }
 
-    private static Pipeline buildPipeline(GstVideoComponent videoComponent, String encoding, int port) {
+    private static Pipeline buildCombinedPipeline(GstVideoComponent videoComponent, String videoEncoding, int videoPort,
+            String audioEncoding, int audioPort) {
+        Pipeline pipeline = new Pipeline("combined-pipeline");
+
+        // Video branch
+        videoUdpSrc = ElementFactory.make("udpsrc", "video_src");
+        videoUdpSrc.set("port", videoPort);
+        videoUdpSrc.set("caps", Caps.fromString(
+                "application/x-rtp, media=video, encoding-name=" + videoEncoding + ", clock-rate=90000"));
+
+        Element jitter = ElementFactory.make("rtpjitterbuffer", "jitter");
+        jitter.set("latency", 0);
+
+        Element queue = ElementFactory.make("queue", "queue");
+        queue.set("max-size-buffers", 1);
+
+        Element depay = ElementFactory.make(selectDepay(videoEncoding), "depay");
+        Element parse = createParse(videoEncoding);
+        Element decoder = createDecoder(videoEncoding);
+        Element convert = ElementFactory.make("videoconvert", "convert");
+
+        // Compositor for overlay
+        Element mixer = ElementFactory.make("compositor", "mixer");
+
+        Element sink = videoComponent.getElement();
+        sink.set("sync", false);
+        sink.set("async", false);
+
+        // Add video elements
+        List<Element> elements = new ArrayList<>();
+        elements.add(videoUdpSrc);
+        elements.add(jitter);
+        elements.add(queue);
+        elements.add(depay);
+        if (parse != null) {
+            elements.add(parse);
+        }
+        elements.add(decoder);
+        elements.add(convert);
+        elements.add(mixer);
+        elements.add(sink);
+
+        // Audio branch
+        Element audioUdpSrc = ElementFactory.make("udpsrc", "audio_src");
+        audioUdpSrc.set("port", audioPort);
+        audioUdpSrc.set("caps", Caps.fromString(
+                "application/x-rtp, media=audio, encoding-name=" + audioEncoding));
+
+        Element audioQueue = ElementFactory.make("queue", "audio_queue");
+        audioQueue.set("max-size-buffers", 1);
+
+        Element audioDepay = tryCreateElement(selectAudioDepay(audioEncoding), "audio_depay");
+        Element audioDecoder = createAudioDecoder(audioEncoding);
+        Element audioConvert = ElementFactory.make("audioconvert", "audio_convert");
+
+        // Tee for audio splitting
+        Element tee = ElementFactory.make("tee", "audio_tee");
+
+        // Audio output branch
+        Element audioOutQueue = ElementFactory.make("queue", "audio_output_queue");
+        String sinkFactory;
+        if (isWindows()) {
+            sinkFactory = "directsoundsink";
+        } else if (isLinux()) {
+            sinkFactory = "pulsesink";
+        } else {
+            sinkFactory = "osxaudiosink";
+        }
+        Element audioSink = tryCreateElement(sinkFactory, "audio_sink");
+        if (audioSink == null) {
+            audioSink = tryCreateElement("autoaudiosink", "audio_sink");
+        }
+
+        if (audioDepay != null && audioDecoder != null && audioSink != null) {
+            audioSink.set("sync", false);
+            audioSink.set("async", false);
+
+            elements.add(audioUdpSrc);
+            elements.add(audioQueue);
+            elements.add(audioDepay);
+            elements.add(audioDecoder);
+            elements.add(audioConvert);
+            elements.add(tee);
+            elements.add(audioOutQueue);
+            elements.add(audioSink);
+        }
+
+        pipeline.addMany(elements.toArray(new Element[0]));
+
+        // Link video path to mixer
+        if (parse != null) {
+            Element.linkMany(videoUdpSrc, jitter, queue, depay, parse, decoder, convert);
+        } else {
+            Element.linkMany(videoUdpSrc, jitter, queue, depay, decoder, convert);
+        }
+
+        // Link convert to mixer sink_0 (main video)
+        Pad mixerSink0 = mixer.getRequestPad("sink_%u");
+        mixerSink0.set("xpos", 0);
+        mixerSink0.set("ypos", 0);
+        convert.getStaticPad("src").link(mixerSink0);
+
+        // Link mixer to sink
+        mixer.link(sink);
+
+        // Link audio path
+        if (audioDepay != null && audioDecoder != null && audioSink != null) {
+            Element.linkMany(audioUdpSrc, audioQueue, audioDepay, audioDecoder, audioConvert, tee);
+            Element.linkMany(tee, audioOutQueue, audioSink);
+
+            // Add spectrum visualizer
+            addSpectrumOverlay(pipeline, mixer, tee);
+        }
+
+        return pipeline;
+    }
+
+    private static Pipeline buildPipeline(GstVideoComponent videoComponent, String encoding, int port, Pipeline audioPipeline) {
         videoUdpSrc = ElementFactory.make("udpsrc", "src");
         videoUdpSrc.set("port", port);
         videoUdpSrc.set("caps", Caps.fromString(
@@ -120,6 +234,10 @@ public class main {
         Element parse = createParse(encoding);
         Element decoder = createDecoder(encoding);
         Element convert = ElementFactory.make("videoconvert", "convert");
+
+        // Add videomixer for overlay
+        Element mixer = ElementFactory.make("compositor", "mixer");
+
         Element sink = videoComponent.getElement();
         sink.set("sync", false);
         sink.set("async", false);
@@ -135,10 +253,66 @@ public class main {
         }
         elements.add(decoder);
         elements.add(convert);
+        elements.add(mixer);
         elements.add(sink);
         pipeline.addMany(elements.toArray(new Element[0]));
-        Element.linkMany(elements.toArray(new Element[0]));
+
+        // Link video path to mixer
+        if (parse != null) {
+            Element.linkMany(videoUdpSrc, jitter, queue, depay, parse, decoder, convert);
+        } else {
+            Element.linkMany(videoUdpSrc, jitter, queue, depay, decoder, convert);
+        }
+
+        // Link convert to mixer sink_0 (main video)
+        Pad mixerSink0 = mixer.getRequestPad("sink_%u");
+        mixerSink0.set("xpos", 0);
+        mixerSink0.set("ypos", 0);
+        convert.getStaticPad("src").link(mixerSink0);
+
+        // Link mixer to sink
+        mixer.link(sink);
+
+        // Add spectrum visualizer if audio pipeline exists
+        if (audioPipeline != null) {
+            addSpectrumOverlay(audioPipeline, pipeline, mixer);
+        }
+
         return pipeline;
+    }
+
+    private static void addSpectrumOverlay(Pipeline pipeline, Element mixer, Element audioTee) {
+        // Spectrum visualizer branch from audio tee
+        Element visQueue = ElementFactory.make("queue", "vis_queue");
+        Element spectra = tryCreateElement("spectrascope", "spectrascope");
+        if (spectra == null) {
+            return;
+        }
+
+        // Configure spectrum visualization
+        spectra.set("shader", 1); // SHADER_FADE
+
+        Element capsFilter = ElementFactory.make("capsfilter", "vis_caps");
+        capsFilter.set("caps", Caps.fromString("video/x-raw,width=320,height=240"));
+
+        Element videoConvert = ElementFactory.make("videoconvert", "vis_convert");
+        Element videoScale = ElementFactory.make("videoscale", "vis_scale");
+
+        pipeline.addMany(visQueue, spectra, capsFilter, videoConvert, videoScale);
+        Element.linkMany(visQueue, spectra, capsFilter, videoConvert, videoScale);
+
+        // Link tee to visualizer queue
+        Element.linkMany(audioTee, visQueue);
+
+        // Link visualizer to mixer sink_1 (overlay) - bottom left position
+        Pad mixerSink1 = mixer.getRequestPad("sink_%u");
+        mixerSink1.set("xpos", 10);   // 10px from left
+        mixerSink1.set("ypos", 10);   // Will be updated dynamically based on video height
+        mixerSink1.set("alpha", 0.8); // Semi-transparent
+        videoScale.getStaticPad("src").link(mixerSink1);
+
+        // Store mixer pad reference to update ypos when video size is known
+        spectrumMixerPad = mixerSink1;
     }
 
     private static Pipeline buildAudioPipeline(String encoding, int port) {
@@ -154,6 +328,11 @@ public class main {
         Element decoder = createAudioDecoder(encoding);
         Element convert = ElementFactory.make("audioconvert", "audio_convert");
 
+        // Tee for audio splitting
+        Element tee = ElementFactory.make("tee", "audio_tee");
+
+        // Audio output branch
+        Element audioQueue = ElementFactory.make("queue", "audio_output_queue");
         String sinkFactory;
         if (isWindows()) {
             sinkFactory = "directsoundsink";
@@ -173,15 +352,10 @@ public class main {
         sink.set("async", false);
 
         Pipeline pipeline = new Pipeline("audio-pipeline");
-        List<Element> elements = new ArrayList<>();
-        elements.add(udpSrc);
-        elements.add(queue);
-        elements.add(depay);
-        elements.add(decoder);
-        elements.add(convert);
-        elements.add(sink);
-        pipeline.addMany(elements.toArray(new Element[0]));
-        Element.linkMany(elements.toArray(new Element[0]));
+        pipeline.addMany(udpSrc, queue, depay, decoder, convert, tee, audioQueue, sink);
+        Element.linkMany(udpSrc, queue, depay, decoder, convert, tee);
+        Element.linkMany(tee, audioQueue, sink);
+
         return pipeline;
     }
 
@@ -200,11 +374,11 @@ public class main {
         JRadioButtonMenuItem vp9Item = new JRadioButtonMenuItem("VP9");
         JRadioButtonMenuItem av1Item = new JRadioButtonMenuItem("AV1");
 
-        h264Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, statusLabel, ENCODING_H264));
-        h265Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, statusLabel, ENCODING_H265));
-        vp8Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, statusLabel, ENCODING_VP8));
-        vp9Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, statusLabel, ENCODING_VP9));
-        av1Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, statusLabel, ENCODING_AV1));
+        h264Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_H264));
+        h265Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_H265));
+        vp8Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_VP8));
+        vp9Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_VP9));
+        av1Item.addActionListener(e -> switchCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_AV1));
 
         group.add(h264Item);
         group.add(h265Item);
@@ -225,8 +399,8 @@ public class main {
 
         Map<Integer, JRadioButtonMenuItem> portItems = new HashMap<>();
         ButtonGroup portGroup = new ButtonGroup();
-        addPortItem(portMenu, portGroup, portItems, 5000, frame, videoComponent, pipelineRef, statusLabel);
-        addPortItem(portMenu, portGroup, portItems, 6000, frame, videoComponent, pipelineRef, statusLabel);
+        addPortItem(portMenu, portGroup, portItems, 5000, frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel);
+        addPortItem(portMenu, portGroup, portItems, 6000, frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel);
 
         portMenu.addSeparator();
         JMenuItem customPort = new JMenuItem("Custom...");
@@ -240,7 +414,7 @@ public class main {
                 if (port <= 0 || port > 65535) {
                     return;
                 }
-                switchPort(frame, videoComponent, pipelineRef, statusLabel, port);
+                switchPort(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, port);
                 JRadioButtonMenuItem item = portItems.get(port);
                 if (item != null) {
                     item.setSelected(true);
@@ -254,8 +428,8 @@ public class main {
         ButtonGroup audioCodecGroup = new ButtonGroup();
         JRadioButtonMenuItem opusItem = new JRadioButtonMenuItem("OPUS", ENCODING_OPUS.equals(currentAudioEncoding));
         JRadioButtonMenuItem pcmuItem = new JRadioButtonMenuItem("PCMU", ENCODING_PCMU.equals(currentAudioEncoding));
-        opusItem.addActionListener(e -> switchAudioCodec(audioPipelineRef, statusLabel, ENCODING_OPUS));
-        pcmuItem.addActionListener(e -> switchAudioCodec(audioPipelineRef, statusLabel, ENCODING_PCMU));
+        opusItem.addActionListener(e -> switchAudioCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_OPUS));
+        pcmuItem.addActionListener(e -> switchAudioCodec(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, ENCODING_PCMU));
         audioCodecGroup.add(opusItem);
         audioCodecGroup.add(pcmuItem);
         audioCodecMenu.add(opusItem);
@@ -263,8 +437,8 @@ public class main {
 
         Map<Integer, JRadioButtonMenuItem> audioPortItems = new HashMap<>();
         ButtonGroup audioPortGroup = new ButtonGroup();
-        addAudioPortItem(audioPortMenu, audioPortGroup, audioPortItems, 5001, audioPipelineRef, statusLabel);
-        addAudioPortItem(audioPortMenu, audioPortGroup, audioPortItems, 6001, audioPipelineRef, statusLabel);
+        addAudioPortItem(audioPortMenu, audioPortGroup, audioPortItems, 5001, frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel);
+        addAudioPortItem(audioPortMenu, audioPortGroup, audioPortItems, 6001, frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel);
         audioPortMenu.addSeparator();
         JMenuItem customAudioPort = new JMenuItem("Custom...");
         customAudioPort.addActionListener(e -> {
@@ -277,7 +451,7 @@ public class main {
                 if (port <= 0 || port > 65535) {
                     return;
                 }
-                switchAudioPort(audioPipelineRef, statusLabel, port);
+                switchAudioPort(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, port);
                 JRadioButtonMenuItem item = audioPortItems.get(port);
                 if (item != null) {
                     item.setSelected(true);
@@ -291,54 +465,57 @@ public class main {
     }
 
     private static void switchCodec(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef,
-            JLabel statusLabel, String encoding) {
+            Pipeline[] audioPipelineRef, JLabel statusLabel, String encoding) {
         if (encoding.equals(currentEncoding)) {
             return;
         }
         currentEncoding = encoding;
         timeoutEnabled = false;
 
-        restartPipeline(frame, videoComponent, pipelineRef);
+        restartPipeline(frame, videoComponent, pipelineRef, audioPipelineRef);
         updateStatusLabel(statusLabel);
     }
 
-    private static void switchAudioCodec(Pipeline[] audioPipelineRef, JLabel statusLabel, String encoding) {
+    private static void switchAudioCodec(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef,
+            Pipeline[] audioPipelineRef, JLabel statusLabel, String encoding) {
         if (encoding.equals(currentAudioEncoding)) {
             return;
         }
         currentAudioEncoding = encoding;
-        restartAudioPipeline(audioPipelineRef);
+        restartPipeline(frame, videoComponent, pipelineRef, audioPipelineRef);
         updateStatusLabel(statusLabel);
     }
 
     private static void switchPort(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef,
-            JLabel statusLabel, int port) {
+            Pipeline[] audioPipelineRef, JLabel statusLabel, int port) {
         if (port == currentPort) {
             return;
         }
         currentPort = port;
         timeoutEnabled = false;
-        restartPipeline(frame, videoComponent, pipelineRef);
+        restartPipeline(frame, videoComponent, pipelineRef, audioPipelineRef);
         updateStatusLabel(statusLabel);
     }
 
-    private static void switchAudioPort(Pipeline[] audioPipelineRef, JLabel statusLabel, int port) {
+    private static void switchAudioPort(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef,
+            Pipeline[] audioPipelineRef, JLabel statusLabel, int port) {
         if (port == currentAudioPort) {
             return;
         }
         currentAudioPort = port;
-        restartAudioPipeline(audioPipelineRef);
+        restartPipeline(frame, videoComponent, pipelineRef, audioPipelineRef);
         updateStatusLabel(statusLabel);
     }
 
-    private static void restartPipeline(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef) {
+    private static void restartPipeline(JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef, Pipeline[] audioPipelineRef) {
         Pipeline oldPipeline = pipelineRef[0];
         if (oldPipeline != null) {
             oldPipeline.stop();
             oldPipeline.dispose();
         }
 
-        Pipeline newPipeline = buildPipeline(videoComponent, currentEncoding, currentPort);
+        spectrumMixerPad = null;
+        Pipeline newPipeline = buildCombinedPipeline(videoComponent, currentEncoding, currentPort, currentAudioEncoding, currentAudioPort);
         pipelineRef[0] = newPipeline;
         newPipeline.play();
         startAutoResize(frame, videoComponent, videoComponent.getElement());
@@ -456,18 +633,19 @@ public class main {
     }
 
     private static void addPortItem(JMenu portMenu, ButtonGroup portGroup, Map<Integer, JRadioButtonMenuItem> portItems,
-            int port, JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef, JLabel statusLabel) {
+            int port, JFrame frame, GstVideoComponent videoComponent, Pipeline[] pipelineRef, Pipeline[] audioPipelineRef, JLabel statusLabel) {
         JRadioButtonMenuItem item = new JRadioButtonMenuItem(String.valueOf(port), port == currentPort);
-        item.addActionListener(e -> switchPort(frame, videoComponent, pipelineRef, statusLabel, port));
+        item.addActionListener(e -> switchPort(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, port));
         portGroup.add(item);
         portMenu.add(item);
         portItems.put(port, item);
     }
 
     private static void addAudioPortItem(JMenu portMenu, ButtonGroup portGroup,
-            Map<Integer, JRadioButtonMenuItem> portItems, int port, Pipeline[] audioPipelineRef, JLabel statusLabel) {
+            Map<Integer, JRadioButtonMenuItem> portItems, int port, JFrame frame, GstVideoComponent videoComponent,
+            Pipeline[] pipelineRef, Pipeline[] audioPipelineRef, JLabel statusLabel) {
         JRadioButtonMenuItem item = new JRadioButtonMenuItem(String.valueOf(port), port == currentAudioPort);
-        item.addActionListener(e -> switchAudioPort(audioPipelineRef, statusLabel, port));
+        item.addActionListener(e -> switchAudioPort(frame, videoComponent, pipelineRef, audioPipelineRef, statusLabel, port));
         portGroup.add(item);
         portMenu.add(item);
         portItems.put(port, item);
@@ -545,11 +723,23 @@ public class main {
                 frame.pack();
                 frame.setLocationRelativeTo(null);
                 enableTimeout();
+                updateSpectrumPosition(size);
                 ((Timer) e.getSource()).stop();
             }
         });
         timer.setRepeats(true);
         timer.start();
+    }
+
+    private static void updateSpectrumPosition(Dimension videoSize) {
+        if (spectrumMixerPad == null) {
+            return;
+        }
+        // Position spectrum at bottom left: ypos = video_height - spectrum_height - margin
+        int spectrumHeight = 240;
+        int margin = 10;
+        int ypos = videoSize.height - spectrumHeight - margin;
+        spectrumMixerPad.set("ypos", ypos);
     }
 
     private static Dimension getVideoSize(Element sink) {
