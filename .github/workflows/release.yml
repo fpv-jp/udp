@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            os: darwin
+            arch: arm64
+            build-sender: true
+            maven-profile: macos
+            installer-ext: dmg
+            upload-jar: true
+          - runner: ubuntu-latest
+            os: linux
+            arch: amd64
+            build-sender: true
+            maven-profile: linux
+            installer-ext: deb
+            upload-jar: false
+          - runner: windows-latest
+            os: windows
+            arch: amd64
+            build-sender: false
+            maven-profile: windows
+            installer-ext: msi
+            upload-jar: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Go sender (macOS / Linux only) ──────────────────────────
+      - name: Setup Go
+        if: matrix.build-sender
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Install GStreamer dev headers (macOS)
+        if: matrix.os == 'darwin'
+        run: brew install gstreamer gst-plugins-base
+
+      - name: Install GStreamer dev headers (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Build Go sender
+        if: matrix.build-sender
+        working-directory: sender
+        run: go build -o sender-${{ matrix.os }}-${{ matrix.arch }}
+
+      # ── Java receiver (all platforms) ───────────────────────────
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Build Java receiver
+        working-directory: receiver
+        run: mvn clean -P${{ matrix.maven-profile }} package -DskipTests
+
+      # ── Collect artifacts ───────────────────────────────────────
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sender/sender-${{ matrix.os }}-${{ matrix.arch }}
+            receiver/target/dist/*.${{ matrix.installer-ext }}
+            ${{ matrix.upload-jar && 'receiver/target/udp-jar-with-dependencies.jar' || '' }}
