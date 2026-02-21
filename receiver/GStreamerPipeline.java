@@ -1,16 +1,15 @@
-import org.freedesktop.gstreamer.Caps;
+import org.freedesktop.gstreamer.Bin;
 import org.freedesktop.gstreamer.Element;
 import org.freedesktop.gstreamer.ElementFactory;
-import org.freedesktop.gstreamer.Pad;
+import org.freedesktop.gstreamer.Gst;
 import org.freedesktop.gstreamer.Pipeline;
 import org.freedesktop.gstreamer.swing.GstVideoComponent;
 
 import java.util.logging.Logger;
-import java.util.logging.Level;
 
 /**
  * Manages a GStreamer pipeline for receiving video and audio over UDP/RTP.
- * Uses auto elements (decodebin, autovideosink, autoaudiosink) for automatic codec detection.
+ * Uses Gst.parseLaunch() to build the pipeline from a description string.
  */
 public class GStreamerPipeline {
     private static final Logger logger = Logger.getLogger(GStreamerPipeline.class.getName());
@@ -25,7 +24,7 @@ public class GStreamerPipeline {
      * @param videoComponent The video component for display
      * @param videoCodec Video codec encoding name (e.g., "H264", "H265", "VP8", "VP9", "AV1")
      * @param videoPort Video UDP port
-     * @param audioCodec Audio codec encoding name (e.g., "OPUS", "PCMU")
+     * @param audioCodec Audio codec encoding name (e.g., "OPUS")
      * @param audioPort Audio UDP port
      */
     public GStreamerPipeline(GstVideoComponent videoComponent, String videoCodec, int videoPort,
@@ -33,102 +32,68 @@ public class GStreamerPipeline {
         logger.info(String.format("Creating pipeline: Video=%s:%d, Audio=%s:%d",
                                   videoCodec, videoPort, audioCodec, audioPort));
         this.videoComponent = videoComponent;
-        this.pipeline = new Pipeline("fpv-pipeline");
 
-        // Build video branch
-        videoUdpSrc = buildVideoBranch(videoCodec, videoPort);
+        // Build pipeline description and parse
+        String description = buildPipelineDescription(videoCodec, videoPort, audioCodec, audioPort);
+        logger.fine("Pipeline description: " + description);
+        this.pipeline = (Pipeline) Gst.parseLaunch(description);
 
-        // Build audio branch
-        buildAudioBranch(audioCodec, audioPort);
+        // Replace fakesink placeholder with the actual video component
+        Element fakeSink = pipeline.getElementByName("video_sink_placeholder");
+        Element videoConvert = pipeline.getElementByName("video_convert");
+        pipeline.remove(fakeSink);
+
+        Element videoSink = videoComponent.getElement();
+        videoSink.set("sync", false);
+        videoSink.set("async", false);
+        pipeline.add(videoSink);
+        videoConvert.link(videoSink);
+
+        // Get named elements for later use
+        this.videoUdpSrc = pipeline.getElementByName("video_src");
 
         logger.info("Pipeline created successfully");
     }
 
-    private Element buildVideoBranch(String videoCodec, int videoPort) {
-        logger.info("Building video branch: " + videoCodec + " on port " + videoPort);
+    private String buildPipelineDescription(String videoCodec, int videoPort,
+                                            String audioCodec, int audioPort) {
+        return buildVideoBranch(videoCodec, videoPort) + " " + buildAudioBranch(audioCodec, audioPort);
+    }
 
-        // Video source
-        Element udpSrc = ElementFactory.make("udpsrc", "video_src");
-        udpSrc.set("port", videoPort);
-        udpSrc.set("caps", Caps.fromString(
-            "application/x-rtp, media=video, encoding-name=" + videoCodec + ", clock-rate=90000"));
-        logger.fine("Created udpsrc for video");
+    private String buildVideoBranch(String videoCodec, int videoPort) {
+        String depayloader = getDepayloaderName(videoCodec);
+        String parser = getParserName(videoCodec);
+        String decoder = getVideoDecoderName(videoCodec);
 
-        // RTP jitter buffer
-        Element jitter = ElementFactory.make("rtpjitterbuffer", "jitter");
-        jitter.set("latency", 0);
-
-        // Queue for buffering
-        Element queue = ElementFactory.make("queue", "video_queue");
-        queue.set("max-size-buffers", 1);
-
-        // RTP depayloader
-        Element depay = ElementFactory.make(getDepayloader(videoCodec), "video_depay");
-
-        // Parser (if needed)
-        Element parse = createVideoParser(videoCodec);
-
-        // Explicit decoder for low latency
-        Element decoder = createVideoDecoder(videoCodec);
-
-        // Video converter
-        Element convert = ElementFactory.make("videoconvert", "video_convert");
-
-        // Video sink
-        Element sink = videoComponent.getElement();
-        sink.set("sync", false);
-        sink.set("async", false);
-
-        // Add elements to pipeline
-        if (parse != null) {
-            pipeline.addMany(udpSrc, jitter, queue, depay, parse, decoder, convert, sink);
-            Element.linkMany(udpSrc, jitter, queue, depay, parse, decoder, convert, sink);
-        } else {
-            pipeline.addMany(udpSrc, jitter, queue, depay, decoder, convert, sink);
-            Element.linkMany(udpSrc, jitter, queue, depay, decoder, convert, sink);
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format(
+            "udpsrc name=video_src port=%d caps=\"application/x-rtp, media=video, encoding-name=%s, clock-rate=90000\"",
+            videoPort, videoCodec));
+        sb.append(" ! rtpjitterbuffer latency=0");
+        sb.append(" ! queue max-size-buffers=1");
+        sb.append(" ! ").append(depayloader);
+        if (parser != null) {
+            sb.append(" ! ").append(parser);
         }
+        sb.append(" ! ").append(decoder);
+        sb.append(" ! videoconvert name=video_convert");
+        sb.append(" ! fakesink name=video_sink_placeholder");
 
-        logger.info("Video branch built successfully");
-        return udpSrc;
+        return sb.toString();
     }
 
-    private void buildAudioBranch(String audioCodec, int audioPort) {
-        logger.info("Building audio branch: " + audioCodec + " on port " + audioPort);
-
-        // Audio source
-        Element udpSrc = ElementFactory.make("udpsrc", "audio_src");
-        udpSrc.set("port", audioPort);
-        udpSrc.set("caps", Caps.fromString(
-            "application/x-rtp, media=audio, encoding-name=" + audioCodec));
-        logger.fine("Created udpsrc for audio");
-
-        // Queue for buffering
-        Element queue = ElementFactory.make("queue", "audio_queue");
-        queue.set("max-size-buffers", 1);
-
-        // RTP depayloader
-        Element depay = ElementFactory.make(getAudioDepayloader(audioCodec), "audio_depay");
-
-        // Explicit audio decoder for low latency
-        Element decoder = createAudioDecoder(audioCodec);
-
-        // Audio converter
-        Element convert = ElementFactory.make("audioconvert", "audio_convert");
-
-        // Auto audio sink (automatically selects the best audio sink for the platform)
-        Element sink = ElementFactory.make("autoaudiosink", "audio_sink");
-        sink.set("sync", false);
-
-        // Add elements to pipeline
-        pipeline.addMany(udpSrc, queue, depay, decoder, convert, sink);
-
-        // Link elements
-        Element.linkMany(udpSrc, queue, depay, decoder, convert, sink);
-
-        logger.info("Audio branch built successfully");
+    private String buildAudioBranch(String audioCodec, int audioPort) {
+        return String.format(
+            "udpsrc port=%d caps=\"application/x-rtp, media=audio, encoding-name=%s\"" +
+            " ! queue max-size-buffers=1" +
+            " ! rtpopusdepay" +
+            " ! opusdec" +
+            " ! audioconvert" +
+            " ! autoaudiosink sync=false",
+            audioPort, audioCodec);
     }
 
-    private String getDepayloader(String codec) {
+    private String getDepayloaderName(String codec) {
         switch (codec.toUpperCase()) {
             case "H265":
                 return "rtph265depay";
@@ -144,45 +109,29 @@ public class GStreamerPipeline {
         }
     }
 
-    private String getAudioDepayloader(String codec) {
-        // Only OPUS is supported
-        return "rtpopusdepay";
-    }
-
-    private Element createVideoParser(String codec) {
-        String parserName = null;
+    private String getParserName(String codec) {
         switch (codec.toUpperCase()) {
             case "H264":
-                parserName = "h264parse";
-                break;
+                return "h264parse";
             case "H265":
-                parserName = "h265parse";
-                break;
+                return "h265parse";
             case "VP9":
-                parserName = "vp9parse";
-                break;
+                return "vp9parse";
             case "AV1":
-                parserName = "av1parse";
-                break;
+                return "av1parse";
             case "VP8":
-                // VP8 doesn't need a parser
+            default:
                 return null;
         }
-
-        if (parserName != null) {
-            try {
-                return ElementFactory.make(parserName, "video_parse");
-            } catch (Exception e) {
-                logger.warning("Failed to create parser " + parserName + ": " + e.getMessage());
-                return null;
-            }
-        }
-        return null;
     }
 
-    private Element createVideoDecoder(String codec) {
+    /**
+     * Returns the best available video decoder name for the given codec.
+     * Tries platform-specific hardware decoders first, falling back to software decoders.
+     */
+    private String getVideoDecoderName(String codec) {
         String os = System.getProperty("os.name").toLowerCase();
-        String[] decoders = null;
+        String[] decoders;
 
         switch (codec.toUpperCase()) {
             case "H264":
@@ -238,39 +187,15 @@ public class GStreamerPipeline {
                 decoders = new String[]{"avdec_h264"};
         }
 
-        // Try decoders in order
         for (String decoderName : decoders) {
-            try {
-                Element decoder = ElementFactory.make(decoderName, "video_decoder");
+            if (ElementFactory.find(decoderName) != null) {
                 logger.info("Using video decoder: " + decoderName);
-
-                // Set low-latency properties
-                if (decoderName.equals("vp9dec")) {
-                    try {
-                        decoder.set("threads", 4);
-                    } catch (Exception e) {
-                        // Property might not be supported
-                    }
-                }
-
-                return decoder;
-            } catch (Exception e) {
-                logger.fine("Decoder " + decoderName + " not available, trying next...");
+                return decoderName;
             }
+            logger.fine("Decoder " + decoderName + " not available, trying next...");
         }
 
         throw new RuntimeException("No suitable video decoder found for " + codec);
-    }
-
-    private Element createAudioDecoder(String codec) {
-        // Only OPUS is supported
-        try {
-            Element decoder = ElementFactory.make("opusdec", "audio_decoder");
-            logger.info("Using audio decoder: opusdec");
-            return decoder;
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to create OPUS decoder: " + e.getMessage());
-        }
     }
 
     /**
